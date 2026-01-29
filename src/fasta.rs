@@ -1,6 +1,8 @@
 //! Code for supporting the FASTA directory access.
 
 use std::{
+    collections::HashMap,
+    fs::File,
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
 };
@@ -13,8 +15,14 @@ use crate::error::Error;
 
 static EXPECTED_SCHEMA_VERSION: u32 = 1;
 
+/// A cached noodles FASTA indexed reader over a BGZF file.
+///
+/// The reader holds open file descriptors for the `.fa.bgz` file. The
+/// `.gzi` and `.fai` indexes are read into memory once at construction.
+type FastaIndexedReader = noodles::fasta::io::IndexedReader<noodles::bgzf::IndexedReader<File>>;
+
 /// A record from the `db.sqlite3` database.
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Clone)]
 pub struct SeqInfoRecord {
     pub seq_id: String,
     pub len: usize,
@@ -33,7 +41,15 @@ pub struct SeqInfoRecord {
 /// When the key is a hash based on sequence (e.g., SHA512), the combination provides a
 /// convenient non-redundant storage of sequences with fast access to sequences and sequence
 /// slices, compact storage and easy replication.
-#[derive(Debug)]
+impl std::fmt::Debug for FastaDir {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FastaDir")
+            .field("root_dir", &self.root_dir)
+            .field("schema_version", &self.schema_version)
+            .finish_non_exhaustive()
+    }
+}
+
 pub struct FastaDir {
     /// The path to the directory ("$instance/sequences" within seqrepo).
     root_dir: PathBuf,
@@ -41,6 +57,10 @@ pub struct FastaDir {
     conn: Arc<Mutex<Connection>>,
     /// Schema version.
     schema_version: u32,
+    /// Cache of open FASTA indexed readers, keyed by relpath.
+    reader_cache: Mutex<HashMap<String, FastaIndexedReader>>,
+    /// Cache of SeqInfoRecord lookups, keyed by seq_id.
+    seqinfo_cache: Mutex<HashMap<String, SeqInfoRecord>>,
 }
 
 impl FastaDir {
@@ -70,6 +90,8 @@ impl FastaDir {
                 root_dir,
                 conn,
                 schema_version,
+                reader_cache: Mutex::new(HashMap::new()),
+                seqinfo_cache: Mutex::new(HashMap::new()),
             })
         }
     }
@@ -91,6 +113,26 @@ impl FastaDir {
     /// Schema version as read from the database.
     pub fn schema_version(&self) -> u32 {
         self.schema_version
+    }
+
+    /// Load `SeqInfoRecord` from database, with caching.
+    ///
+    /// On first call for a given `seq_id`, queries SQLite and stores the
+    /// result. Subsequent calls return a clone of the cached value.
+    pub fn fetch_seqinfo_cached(&self, seq_id: &str) -> Result<SeqInfoRecord, Error> {
+        {
+            let cache = self.seqinfo_cache.lock().map_err(|_| Error::MutexSqlite)?;
+            if let Some(record) = cache.get(seq_id) {
+                return Ok(record.clone());
+            }
+        }
+        // Cache miss — query database (lock released so conn lock is available)
+        let record = self.fetch_seqinfo(seq_id)?;
+        {
+            let mut cache = self.seqinfo_cache.lock().map_err(|_| Error::MutexSqlite)?;
+            cache.insert(seq_id.to_string(), record.clone());
+        }
+        Ok(record)
     }
 
     /// Load `SeqInfoRecord` from database.
@@ -124,47 +166,59 @@ impl FastaDir {
         self.fetch_sequence_part(seq_id, None, None)
     }
 
-    /// Load sequence fragment from FASTA directory.
+    /// Load sequence fragment from FASTA directory, using cached readers and seqinfo.
     pub fn fetch_sequence_part(
         &self,
         seq_id: &str,
         begin: Option<usize>,
         end: Option<usize>,
     ) -> Result<String, Error> {
-        let seqinfo = self.fetch_seqinfo(seq_id)?;
+        let seqinfo = self.fetch_seqinfo_cached(seq_id)?;
 
-        let path_bgzip = self.root_dir.join(seqinfo.relpath);
-        let path_bgzip = path_bgzip.as_path().to_str().unwrap();
-
-        let bgzf_index = noodles::bgzf::gzi::read(format!("{path_bgzip}.gzi"))
-            .map_err(|e| Error::SeqRepoGziOpen(e.to_string()))?;
-        let bgzf_reader = noodles::bgzf::indexed_reader::Builder::default()
-            .set_index(bgzf_index)
-            .build_from_path(path_bgzip)
-            .map_err(|e| Error::SeqRepoBgzfOpen(e.to_string()))?;
-        let fai_index = noodles::fasta::fai::read(format!("{path_bgzip}.fai"))
-            .map_err(|e| Error::SeqRepoFaiOpen(e.to_string()))?;
-        let mut fai_reader = noodles::fasta::indexed_reader::Builder::default()
-            .set_index(fai_index)
-            .build_from_reader(bgzf_reader)
-            .map_err(|e| Error::SeqRepoFastaOpen(e.to_string()))?;
-
-        let start = Position::try_from(begin.map(|start| start + 1).unwrap_or(1))
+        let start = Position::try_from(begin.map(|s| s + 1).unwrap_or(1))
             .map_err(|e| Error::ConvertPosition(e.to_string()))?;
         let end = Position::try_from(
-            end.map(|end| std::cmp::min(end, seqinfo.len))
+            end.map(|e| std::cmp::min(e, seqinfo.len))
                 .unwrap_or(seqinfo.len),
         )
         .map_err(|e| Error::ConvertPosition(e.to_string()))?;
         let region = Region::new(seq_id, start..=end);
 
-        let record = fai_reader
+        let mut reader_cache = self.reader_cache.lock().map_err(|_| Error::MutexSqlite)?;
+
+        if !reader_cache.contains_key(&seqinfo.relpath) {
+            let reader = self.open_fasta_reader(&seqinfo.relpath)?;
+            reader_cache.insert(seqinfo.relpath.clone(), reader);
+        }
+
+        let reader = reader_cache.get_mut(&seqinfo.relpath).unwrap();
+        let record = reader
             .query(&region)
             .map_err(|e| Error::SeqRepoFaiQuery(e.to_string()))?;
 
         Ok(std::str::from_utf8(record.sequence().as_ref())
             .unwrap()
             .to_string())
+    }
+
+    /// Open a FASTA indexed reader for the given relpath.
+    fn open_fasta_reader(&self, relpath: &str) -> Result<FastaIndexedReader, Error> {
+        let path_bgzip = self.root_dir.join(relpath);
+        let path_bgzip_str = path_bgzip.as_path().to_str().unwrap();
+
+        let bgzf_index = noodles::bgzf::gzi::read(format!("{path_bgzip_str}.gzi"))
+            .map_err(|e| Error::SeqRepoGziOpen(e.to_string()))?;
+        let bgzf_reader = noodles::bgzf::indexed_reader::Builder::default()
+            .set_index(bgzf_index)
+            .build_from_path(&path_bgzip)
+            .map_err(|e| Error::SeqRepoBgzfOpen(e.to_string()))?;
+        let fai_index = noodles::fasta::fai::read(format!("{path_bgzip_str}.fai"))
+            .map_err(|e| Error::SeqRepoFaiOpen(e.to_string()))?;
+        let reader = noodles::fasta::indexed_reader::Builder::default()
+            .set_index(fai_index)
+            .build_from_reader(bgzf_reader)
+            .map_err(|e| Error::SeqRepoFastaOpen(e.to_string()))?;
+        Ok(reader)
     }
 }
 
